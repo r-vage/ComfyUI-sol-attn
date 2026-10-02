@@ -6,48 +6,52 @@
 
 **English** | **[中文](./README_ZH.md)**
 
-**Version: v0.6.2**
+**Version: v0.6.6 — maintained continuation** · [Changelog](changelog.md)
 
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-orange)](https://github.com/comfyanonymous/ComfyUI)
-[![GPU](https://img.shields.io/badge/tested-RTX%205090%20(SM120)-76b900)](https://www.nvidia.com/)
+[![Platform](https://img.shields.io/badge/tested-Linux%20Mint%2022.3-blue)](https://linuxmint.com/)
+[![GPU](https://img.shields.io/badge/tested-RTX%204070%20Ti%20SUPER%20(SM89)-76b900)](https://www.nvidia.com/)
 [![Triton](https://img.shields.io/badge/Triton-3.6.0-blue)](https://github.com/triton-lang/triton)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green)](LICENSE)
 
-Sparse attention and memory patches for video diffusion in ComfyUI, built around NVIDIA's **Sol-Attn** Triton reference kernel and tuned for native-Windows consumer Blackwell (SM120 / RTX 50-series). Ships a generic per-model Sol-Attn patch plus four MiniMax H3-specific nodes for copy-free attention, scheduled sparsity, exact modulation fusion, and feed-forward peak-memory reduction.
+Sparse attention and memory patches for video diffusion in ComfyUI, built around NVIDIA's **Sol-Attn** Triton reference kernel. This continuation is developed and validated on **Linux Mint 22.3 with an NVIDIA RTX 4070 Ti SUPER (Ada Lovelace, SM89, 16 GB VRAM)**. Ships a generic per-model Sol-Attn patch plus four MiniMax H3-specific nodes for copy-free attention, scheduled sparsity, exact modulation fusion, and feed-forward peak-memory reduction.
 
-> Legal note: the kernel in `sol_kernel/` is vendored NVIDIA source (Apache-2.0), modified locally. NVIDIA now ships an optional SM120 CuTe backend for Linux; this repository's native-Windows Triton pointer path and residual-int8 extensions remain local changes.
+## Continuation and credits
 
-## v0.6.2
+Maintained by **[r-vage](https://github.com/r-vage)**. This project continues **Saganaki22's original ComfyUI-sol-attn integration** (Git author: `drbaph`) because the original GitHub repository and user account are no longer available. The preserved upstream history ends at **v0.6.2**; **v0.6.3** is the first version of this continuation, covering the compatibility repairs and Linux/SM89 validation described below. This is an independent continuation, not a claim that the original author transferred ownership or endorses these changes.
 
-- **SM86 / RTX 30-series support** — MiniMax H3 Sol Attention now supports Ampere SM86 GPUs through the existing pointer-kernel family used by SM89 and SM120. SM90/SM100/SM121 remain on their existing TMA paths.
-- **Community hardware validation** — an RTX 3090 Ti completed a strict-mode 25,323-token MiniMax H3 workflow with Sol active, then completed a second generation with both `int8_qk` and `int8_pv` disabled. The residual-int8 QK/PV paths were also exercised successfully.
-- **Regression coverage** — the six repository tests applicable to SM86 plus the contributor's local runtime-stack check passed; the SM120-only pointer-vs-TMA comparison was correctly skipped. After merge, all seven repository tests also passed on SM120. Coverage includes architecture dispatch, pointer INT8 paths, H3 modulation fusion, and KJNodes handoff.
-- **No numerical changes** — this release enables an additional architecture without changing attention math, weights, sparsity settings, or output-quality behavior. Existing SM89, SM90, SM100, SM120, and SM121 dispatch is unchanged. SM86 performance has not yet been formally benchmarked.
+Credit remains with **Saganaki22 and the original contributors** for the ComfyUI integration, and **NVIDIA / NVlabs / the Sol-Attn authors** for the underlying attention method and Triton reference kernels. The Apache-2.0 license and existing attribution are retained. Original Windows/RTX 5090 benchmarks are preserved as historical upstream results; they are not measurements from the current Linux machine.
 
-## v0.6.1
+Repository: [r-vage/ComfyUI-sol-attn](https://github.com/r-vage/ComfyUI-sol-attn). The [original repository URL](https://github.com/Saganaki22/ComfyUI-sol-attn) is retained only for attribution and may return 404. Package metadata in [pyproject.toml](pyproject.toml) lists the current maintainer and original author separately.
 
-- **KJNodes Low-VRAM compatibility** — both MiniMax H3 Sol nodes now support the single-item activation-list handoff used by KJNodes' `MiniMax H3 Low VRAM Attention`. Sol peeks at the tensor while applying its eligibility gates, leaves the handoff intact for dense fallback, and consumes/releases it when the Sol path runs.
-- **Combination covered by regression tests** — `KJ MiniMax H3 Low VRAM Attention → MiniMax H3 Memory Efficient Sol Attention` and the scheduled Sol variant now run together without the previous `'list' object has no attribute 'shape'` error. KJ's early activation release is preserved on both sparse and dense calls.
-- **No numerical or kernel changes** — attention math, model weights, SM89/SM120 pointer dispatch, SM90/SM100/SM121 TMA dispatch, and output accuracy are unchanged. All seven regression tests pass, and a real KJ low-VRAM block-forward GPU integration test also passed. The v0.6.0 benchmark matrix remains current.
-- **Existing limitation remains** — KJNodes' `MiniMax H3 Low VRAM Attention` still should not be combined with `MiniMax H3 Fused Modulation`, because both patch the complete H3 block forward. This release fixes its composition with the two local H3 **Sol Attention** nodes.
+> Kernel provenance: `sol_kernel/` contains vendored NVIDIA source (Apache-2.0) with repository modifications. The strided Triton pointer path, residual-INT8 extensions, and historical Windows/SM120 support are retained. The current Linux/SM89 setup uses Triton, not an SM120 CuTe backend.
 
-## v0.6.0
+## ComfyUI compatibility and validation
 
-- **Faster SM120 forward dispatch** — RTX 5090 now uses the pointer forward kernels, while SM89 remains pointer and SM90/100/121 remain TMA. At H3's `B=1, T=8192, H=56, D=128` shape, the SM120 pointer path measured 1.25× the TMA throughput in bf16 and produced bit-identical output; residual-int8 also remained bit-identical.
-- **Inline residual-int8 Q preparation** — SM89/SM120 diagonal-threshold pointer kernels quantize Q and derive the routing threshold from the BF16 Q tile already loaded by the forward. This removes the materialized Q-int8/Q-scale/threshold producer. At 32K H3 tokens it reduced measured peak allocation by 189 MiB; output matched the former path bit-for-bit for aligned/ragged lengths, exact sinks, and `int8_pv` on/off.
-- **Exact MiniMax H3 modulation fusion** — the new `MiniMax H3 Fused Modulation` node fuses segmented AdaLN scale/shift and gated residual updates across all 50 DiT blocks. It explicitly reproduces eager BF16 rounding and matched a real ComfyUI `DiTBlock` bit-for-bit. At 38,247 × 5,376, scale/shift measured 1.91× faster and gate/add 1.22× faster in isolation.
-- **Attention patches still compose** — the fusion resolves each block's attention and MLP dynamically, so the recommended `global KJ Sage → H3 memory-efficient Sage → local H3 Sol` chain remains intact. It does not install an attention backend or change calls outside Sol.
-- **Fresh full release matrix** — a warmed-cache rerun at 8K/16K/32K/65K puts bf16 at 1.38–1.65× SageAttention throughput, residual `int8_qk` at 1.73–1.97×, and opt-in `int8_qk+pv` at 1.98–2.33×. Accuracy stayed at relative L2 `0.00802`/`0.01396` versus the bf16 Sol path.
+Supported interface range: **0.30.1–0.37.0**. Native MiniMax H3 already exists in 0.30.0; 0.30.1 remains this repository's original tested baseline and support floor. Runtime dispatch checks capabilities, without version-number branches. Node IDs, input ordering/defaults, and output types are unchanged.
 
-## v0.5.9
+Masks and precision opt-outs use the captured attention backend. H3 conditioning protection requires a valid current-call layout; unavailable layouts use dense attention. Per-token modulation rows use the original eager block, and feed-forward chunking remains usable without Triton. See the [changelog](changelog.md) for the compatibility changes.
 
-- **Faster residual-int8 preprocessing** — K's 64-token block-mean reduction and residual quantization now run in one Triton kernel with one read of K. On an RTX 5090, the isolated K/V-summary + K-quant preprocessing segment measured 26–36% faster at 8K, 16K, and 65K tokens (the 32K result was noisier). The residual-int8 formulation and FP32 accumulation are unchanged; validation found no routing changes.
-- **All supported architectures keep their forward path** — this is a shared preprocessing optimization. SM89 still uses the pointer forward kernels; SM90/100/120/121 still use the TMA forward kernels. No architecture dispatch was changed.
-- **KJNodes composition is documented explicitly** — for the three-patch MiniMax H3 stack, apply global KJ Sage first, KJ's MiniMax memory-efficient Sage patch second, and this repository's MiniMax Sol patch last. Tokens that Sol declines use the captured memory-efficient Sage forward; attention calls outside that H3 object patch continue to use the global Sage override.
+Validation coverage: CPU wrapper regressions and real release layout/eager-forward definitions passed against all **22 locally available tags from v0.30.1 through v0.37.0**. GPU regressions passed on an **RTX 4070 Ti SUPER (SM89)**, including real-block fusion/callbacks, eager tensor-row fallback, conditioning query rows versus dense attention, INT8 paths, and activation handoff. The **SM120-only pointer/TMA comparison was skipped**. Browser creation and workflow save/reload passed for all five nodes in classic and Nodes 2.0 on **ComfyUI 0.37.0 / frontend 1.53.6**, using an isolated multi-user backend plus Vite serving the installed frontend assets. Unbuilt frontend source was not tested. These checks do **not** establish full-generation quality or performance across every release/GPU; checkpoint generation and broader GPU validation remain pending.
+
+Run CPU regressions without CUDA or Triton (PyTorch required):
+
+```bash
+python -m unittest discover -s tests -p test_compatibility.py -v
+```
+
+Set `COMFYUI_ROOT` to a local ComfyUI Git checkout with release tags to check interfaces, or to an installed source checkout for GPU integration:
+
+```bash
+COMFYUI_ROOT=/path/to/ComfyUI python -m unittest discover -s tests -p test_release_interfaces.py -v
+COMFYUI_ROOT=/path/to/ComfyUI python tests/test_optimizations.py -v
+```
+
+The optional `tests/test_workflow_browser.mjs` uses `COMFY_TEST_URL`, `PLAYWRIGHT_MODULE` (an existing module's absolute entry path), and optionally `CHROMIUM_EXECUTABLE`. Use isolated test-server storage; the harness creates a test user if none exists and changes that user's renderer setting.
 
 ## Why this repo
 
-Measured on an RTX 5090 (current local release matrix in [BENCHMARKS.md](BENCHMARKS.md), 2026-08-09; third-party comparison retained there as historical context):
+Historical measurements on an RTX 5090 (release matrix in [BENCHMARKS.md](BENCHMARKS.md), 2026-08-09; third-party comparison retained there as historical context):
 
 - **1.38–1.65× Sage throughput in bf16** at 8K–65K; residual int8 reaches 1.73–1.97× and opt-in P·V int8 reaches 1.98–2.33×.
 - **Best int8 accuracy** — our kernel quantizes only K's per-block *residual* and keeps the mean term exact in bf16: 0.008 relative L2 vs the exact path, ~3.6× closer than full-key int8 designs (0.029).
@@ -68,10 +72,10 @@ Measured on an RTX 5090 (current local release matrix in [BENCHMARKS.md](BENCHMA
 
 ## Prerequisites
 
-- NVIDIA GPU: **SM86, SM89, SM90, SM100, SM120, or SM121** — SM86/89/120 run the pointer forward kernels; SM90/100/121 run TMA. SM120 is tested and benchmarked locally; SM86 is community hardware smoke-tested on an RTX 3090ti, SM89 is community hardware smoke-tested on an RTX 4080 SUPER ([issue #2](https://github.com/Saganaki22/ComfyUI-sol-attn/issues/2)); and SM121 (DGX Spark) is community-tested. SM86/SM89 performance is not yet benchmarked here.
+- NVIDIA GPU: **SM86, SM89, SM90, SM100, SM120, or SM121** — SM86/89/120 run the pointer forward kernels; SM90/100/121 run TMA. SM120 was tested and benchmarked by the original project on Windows; SM86 is community hardware smoke-tested on an RTX 3090ti, SM89 is community hardware smoke-tested on an RTX 4080 SUPER ([issue #2](https://github.com/Saganaki22/ComfyUI-sol-attn/issues/2)); and SM121 (DGX Spark) is community-tested. SM89 attention performance is also measured locally on an RTX 4070 Ti SUPER; see [Benchmarks](#benchmarks). SM86 performance is not yet benchmarked here.
 - PyTorch with CUDA, **bfloat16** support
 - **Triton** with `triton.tools.tensor_descriptor` (TMA) — verified on 3.6.0
-- ComfyUI (developed against 0.30.0)
+- ComfyUI **0.30.1–0.37.0** (capability-based compatibility; see validation below)
 - For the MiniMax H3 nodes: a MiniMax H3 checkpoint, e.g. `minimax_h3_fl2va_pruned_int8_convrot.safetensors` in `ComfyUI/models/diffusion_models/`
 - matplotlib (optional — only for the tau schedule preview image)
 
@@ -79,12 +83,23 @@ Measured on an RTX 5090 (current local release matrix in [BENCHMARKS.md](BENCHMA
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/Saganaki22/ComfyUI-sol-attn.git
+git clone https://github.com/r-vage/ComfyUI-sol-attn.git
 ```
 
-Restart ComfyUI. There is nothing to pip-install beyond the prerequisites.
+Restart ComfyUI after placing this continuation in `custom_nodes`. Use one copy of this node pack: it preserves the original node IDs for workflow compatibility. The existing CUDA-enabled PyTorch and compatible Triton environment is sufficient. `pyproject.toml` records the optional Linux attention dependency and optional matplotlib preview dependency; the feed-forward node remains usable without Triton.
 
-## Tested on
+## Current validation environment
+
+```text
+Linux Mint 22.3 (x86_64) · NVIDIA driver 595.91.07
+RTX 4070 Ti SUPER · Ada Lovelace · SM89 · 16 GB VRAM
+Python 3.12.10 · PyTorch 2.10.0+cu130 · Triton 3.6.0
+ComfyUI 0.37.0 · frontend 1.53.6 · SageAttention 2.2.0
+```
+
+CPU interface checks span ComfyUI 0.30.1–0.37.0. The current machine passed GPU kernel and real-block regression tests and the attention microbenchmarks in [BENCHMARKS.md](BENCHMARKS.md). Full-checkpoint generation quality and end-to-end generation performance remain unvalidated here.
+
+### Historical upstream environment
 
 ```text
 RTX 5090 (SM120)  ·  torch 2.10.0+cu130  ·  Triton 3.6.0
@@ -92,7 +107,7 @@ Python 3.12.10    ·  ComfyUI 0.30.1      ·  Windows 11
 MiniMax H3 (56 heads × 128, bf16, mask=None) — satisfies all kernel constraints
 ```
 
-Community-tested on **NVIDIA DGX Spark** (SM121, aarch64, CUDA 13.0, Triton 3.6.0) — see [BENCHMARKS.md](BENCHMARKS.md) for the DGX Spark numbers. Sol-Attn's speedup over SageAttention is higher there (1.48–1.92×) because the GB10's LPDDR5X unified memory is bandwidth-bound and Sol-Attn saves bandwidth.
+Historical community testing also covered **NVIDIA DGX Spark** (SM121, aarch64, CUDA 13.0, Triton 3.6.0) — see [BENCHMARKS.md](BENCHMARKS.md) for the DGX Spark numbers. Sol-Attn's speedup over SageAttention is higher there (1.48–1.92×) because the GB10's LPDDR5X unified memory is bandwidth-bound and Sol-Attn saves bandwidth.
 
 Sol-Attn's runtime constraints: `head_dim` exactly 128, bf16, no attention mask, 4D q/k/v with contiguous or TMA-compatible strides. Anything else falls back and logs the reason once per cause.
 
@@ -141,8 +156,8 @@ UNETLoader → Sol-Attn → BasicGuider
 | `min_tokens` | INT | `4096` | Use the normal backend below this sequence length. |
 | `strict` | BOOLEAN | `False` | Raise kernel errors instead of falling back. Enable while validating a new GPU or Triton version. |
 | `thresh_type` | COMBO | `diag` | `diag` (evaluated default) or `exact` — second-moment statistics for more precise routing at extra precompute cost. |
-| `int8_qk` | BOOLEAN | `False` | Quantize q/k to int8 for the exact attention path. The SM120 inline-Q pointer path measured faster from 8K upward and reduced peak allocation by 189 MiB at 32K, at ~1% extra numerical error. This is a repository addition. |
-| `int8_pv` | BOOLEAN | `False` | Additionally quantize the P·V dot to int8 (per-token P, per-channel V). Requires `int8_qk`. Speed is within noise of int8_qk alone on current hardware; accuracy drops to 0.014 rel L2 vs bf16 (from 0.008 with int8_qk alone). Opt-in. |
+| `int8_qk` | BOOLEAN | `False` | Quantize q/k to int8 for the exact attention path. On Linux RTX 4070 Ti SUPER (SM89), measured 1.77–1.96× SageAttention throughput at 4K–65K tokens (`tau=1`, no sinks), with ~0.008 additional relative L2 error versus sparse Sol BF16. This excludes sparsification error versus dense attention. |
+| `int8_pv` | BOOLEAN | `False` | Additionally quantize the P·V dot to int8 (per-token P, per-channel V). Requires `int8_qk`. Speed gains depend on the GPU and sequence length; see benchmarks. Additional error versus Sol bf16 is about 0.014 rel L2 (0.008 with int8_qk alone). This excludes the shared sparsification error versus dense attention. Opt-in. |
 
 **Output:** `model` (`MODEL`)
 
@@ -167,7 +182,7 @@ UNETLoader → MiniMax H3 Memory Efficient Sol Attention Patch → BasicGuider
 | `thresh_type` | COMBO | `diag` | Same estimator choice as node 1. |
 | `int8_qk` | BOOLEAN | `False` | Same int8 q/k toggle as node 1. |
 | `int8_pv` | BOOLEAN | `False` | Same int8 P·V toggle as node 1. Requires `int8_qk`. |
-| `sink_conditioning` | COMBO | `exact_kv` | Keep H3's packed text/conditioning/reference/audio KV blocks exact (~3% cost, protects prompt adherence and audio sync). `exact_kv_and_rows` also runs those query rows dense (~20% cost). `off` disables the sink. |
+| `sink_conditioning` | COMBO | `exact_kv` | Keep H3's packed text/conditioning/reference/audio KV blocks exact to protect conditioning. `exact_kv_and_rows` also runs those query rows dense. Missing or invalid layouts use the captured dense fallback. Cost depends on the GPU and layout; the historical ~3%/~20% figures were not remeasured on SM89. `off` disables the sink. |
 | `dense_blocks` | STRING | empty | Transformer blocks to keep dense, e.g. `0-2,-1` for the first three and the last (negative counts from the end). First/last blocks are the most approximation-sensitive. Empty sparsifies all. |
 
 Only the 50 main DiT blocks are patched; the token refiner and short sequences behave exactly as stock. It can follow a memory-efficient sage attention patch (e.g. KJNodes' MiniMax H3 one): applied **after** it, this node adopts the sage forward as its fallback, so gated and ineligible steps run mem-efficient sage while eligible steps run Sol-Attn. Applied **before** it, the sage patch shadows this node entirely — order matters.
@@ -241,7 +256,21 @@ The benefit scales linearly with the packed sequence: the intermediate is 56 KB 
 
 Cross-repo comparison table (kijai, KingGore, SageAttention, SDPA): [BENCHMARKS.md](BENCHMARKS.md).
 
-Everything below is one machine (see "Tested on"), one kernel build. Treat it as a smoke test with real numbers attached, not a benchmark suite.
+### RTX 4070 Ti SUPER (SM89), 2026-10-02
+
+This repository already uses **Triton**. On the current GPU, the measured attention throughput relative to installed SageAttention 2.2.0 was **1.48–1.56× for BF16**, **1.77–1.96× for INT8 QK**, and **1.87–2.26× for INT8 QK+PV**, across 4K–65K tokens. Selected times in milliseconds per attention call:
+
+| Tokens | SageAttention | Sol BF16 | Sol INT8 QK | Sol INT8 QK+PV |
+|---:|---:|---:|---:|---:|
+| 8,192 | 10.03 | 6.45 | 5.30 | 4.96 |
+| 32,768 | 138.44 | 88.86 | 70.74 | 62.48 |
+| 65,536 | 542.52 | 347.42 | 277.65 | 240.13 |
+
+H3-shaped random BF16 inputs (`B=1, H=56, D=128`), `tau=1.0`, no conditioning sinks; median of 20 after warmup in a second process. This is not the H3 node's default `tau=1.3`/conditioning-protection configuration. Full methodology, memory, error measurements, raw results and the reproducible script are in [BENCHMARKS.md](BENCHMARKS.md#rtx-4070-ti-super-local-run-2026-10-02).
+
+Sol's sparsification changes the output: at 8K, relative L2 versus dense SDPA was **0.750** for sparse BF16, compared with **0.0031** in forced-all-exact mode. The ~0.008/~0.014 INT8 errors are additional differences versus sparse Sol BF16. These synthetic measurements do not establish visual quality or full-video speedups. Third-party Sol repositories were not retested on this GPU.
+
+The older tables below are from the RTX 5090 environment under "Historical upstream environment". They are retained as historical measurements and should not be used as timings for other GPUs.
 
 <details>
 <summary><strong>Attention speed — Sol-Attn vs SageAttention vs PyTorch SDPA</strong></summary>
@@ -301,7 +330,7 @@ Throughput was neutral in isolation (within noise, ±4%). These numbers are spec
 <details>
 <summary><strong>Correctness checks</strong></summary>
 
-On the environment under "Tested on":
+On the environment under "Historical upstream environment":
 
 - Strided-view kernel output is **bit-identical** to contiguous input (max abs diff 0), including at ragged sequence lengths (8,191 / 12,345 / 38,247 tokens).
 - All-exact mode (`tau=-100`, validation only) matches PyTorch SDPA at relative L2 error `0.00097`.
@@ -335,13 +364,16 @@ Each distinct fallback reason is logged once per run. Also note the compile tax:
 
 - **Sol-Attn is approximate.** Output will not be bit-identical to dense attention; whether that shows in your content is your call — A/B it with `enabled`.
 - **MiniMax H3 is not evaluated in the Sol-Attn paper.** H3 uses a joint packed sequence (text, conditioning, audio, video); the `sink_conditioning` option implements the paper's exact conditioning-K/V handling, but dense first-layer scheduling and the rest of the paper's more conservative recipe are not implemented.
-- **The native-Windows SM120 pointer path and SM121 enablement are repository integrations.** NVIDIA's current Sol-Engine branch has an optional Linux CuTe backend for SM120 and a portable Triton fallback; this package retains its own Comfy-compatible strided, residual-int8 implementation. SM121 (DGX Spark) support originated in community PR #3.
+- **The historical Windows/SM120 pointer path and SM121 enablement are inherited repository integrations.** NVIDIA's current Sol-Engine branch has an optional Linux CuTe backend for SM120 and a portable Triton fallback; this package retains its own Comfy-compatible strided, residual-int8 implementation. SM121 (DGX Spark) support originated in community PR #3.
 - **The H3-specific nodes bypass ComfyUI's attention hook.** Other patches attached to `optimized_attention_override` do not run on blocks where Sol is active, and attention `transformer_options` patches are not applied on the Sol path.
-- **Architecture paths are intentionally separate.** SM86, SM89, and SM120 use the pointer family; SM120 is validated and benchmarked on RTX 5090, while SM86 and SM89 are hardware smoke-tested on RTX 30- and RTX 40-series respectively but are not yet performance-benchmarked here. The shared SM86/SM89/SM120 implementation is additionally cross-checked by forced dispatch on SM120. SM90/100/121 remain TMA. Run with `strict=true` once on a new environment.
+- **Architecture paths are intentionally separate.** SM86, SM89, and SM120 use the pointer family; SM120 is validated and benchmarked on RTX 5090; SM89 is also measured on an RTX 4070 Ti SUPER. SM86 is hardware smoke-tested on RTX 30-series but is not yet performance-benchmarked here. The shared SM86/SM89/SM120 implementation is additionally cross-checked by forced dispatch on SM120. SM90/100/121 remain TMA. Run with `strict=true` once on a new environment.
 - NVIDIA's published ~2.0–2.3× figures are for Sol-Engine as a whole (CuTe kernels, NVFP4, block fusion, datacenter GPUs). This is the Triton reference kernel alone — a different thing entirely.
 - The [KingGore Blackwell fork](https://github.com/KingGore/ComfyUI_sol-attn_Blackwell) was evaluated at H3 width: 4.334 ms for its `flex_attention` path vs 3.256 ms for this Triton reference at 8,192 tokens. It uses a hard block mask (unselected blocks are dropped, not approximated), so it is a different method, and its import-time repair that moves files inside the installed PyTorch package is intentionally excluded here.
 
 ## Acknowledgements
+
+- **Saganaki22 (`drbaph`) and original contributors** — created and developed the original ComfyUI-sol-attn integration through v0.6.2. This continuation preserves their work and Git history.
+- **[r-vage](https://github.com/r-vage)** — current continuation maintainer, compatibility repairs, Linux/SM89 validation, and ongoing maintenance.
 
 - **Sol-Attn** — Haopeng Li, Yitong Li, Junsong Chen, Tian Ye, Haozhe Liu, Jincheng Yu, Duomin Wang, Ruihua Zhang, Zeke Xie, Enze Xie, and Song Han (NVIDIA Research, Efficient AI Team & Singapore Lab). The kernel, the method, and the preprocessing in `sol_kernel/` are theirs.
   - Project page: https://nvlabs.github.io/Sana/Sol-Attn/

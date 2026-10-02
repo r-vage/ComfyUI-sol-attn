@@ -1,9 +1,9 @@
 """Sol-Attn (NVIDIA Sana / Sol-Engine) as an opt-in ComfyUI attention backend.
 
 Uses NVIDIA's Triton reference kernel on the explicit architecture set this
-package supports: SM86, SM89, SM90, SM100, SM120, and SM121. SM120 is
-hardware-tested locally; SM86, SM89, and SM121 are user-tested. The shared
-SM86/SM89/SM120 pointer implementation is also cross-checked by forced dispatch.
+package supports: SM86, SM89, SM90, SM100, SM120, and SM121. This continuation
+is validated on Linux with an RTX 4070 Ti SUPER (Ada Lovelace, SM89). Upstream
+validated SM120 on Windows; SM86 and SM121 have historical community coverage.
 
 Hard requirements of the kernel (anything else falls back to your normal
 backend, e.g. SageAttention):
@@ -16,7 +16,9 @@ MiniMax H3 satisfies the kernel's tensor constraints (56 heads x 128, bf16,
 mask=None), but is not one of the model integrations evaluated in the paper.
 """
 
+import inspect
 import logging
+
 import torch
 
 from .sol_kernel import sol_attn
@@ -25,6 +27,14 @@ log = logging.getLogger(__name__)
 
 BLOCK = 64
 SUPPORTED_ARCHES = {(8, 6), (8, 9), (9, 0), (10, 0), (12, 0), (12, 1)}
+
+
+def _attention_arguments(mask=None, attn_precision=None, skip_reshape=False,
+                         skip_output_reshape=False, **kwargs):
+    """ComfyUI's trailing attention arguments, shared across its backends."""
+
+
+_ATTENTION_SIGNATURE = inspect.signature(_attention_arguments)
 
 
 class _Unsupported(Exception):
@@ -51,11 +61,19 @@ def _make_override(tau: float, min_tokens: int, strict: bool, fallback_override=
     dispatch_log = _DispatchLog()
 
     def override(func, q, k, v, heads, *args, **kwargs):
-        mask = kwargs.get("mask", None)
-        skip_reshape = kwargs.get("skip_reshape", False)
-        skip_output_reshape = kwargs.get("skip_output_reshape", False)
+        # Bind outside the fallback catch: duplicate/extra positional arguments
+        # are caller errors, even when strict kernel checking is disabled.
+        bound = _ATTENTION_SIGNATURE.bind(*args, **kwargs)
+        bound.apply_defaults()
+        mask = bound.arguments["mask"]
+        skip_reshape = bound.arguments["skip_reshape"]
+        skip_output_reshape = bound.arguments["skip_output_reshape"]
 
         try:
+            if kwargs.get("low_precision_attention", True) is False:
+                raise _Unsupported("low_precision_attention=False")
+            if bound.arguments["attn_precision"] == torch.float32:
+                raise _Unsupported("float32 attention precision requested")
             if mask is not None:
                 raise _Unsupported("attention mask present")
             if not skip_reshape or q.dim() != 4:
@@ -143,7 +161,7 @@ class SolAttentionPatch:
                         "max": 131072,
                         "step": BLOCK,
                         "tooltip": "Use the normal backend below this sequence "
-                        "length. The paper evaluates RTX 5090 kernels from 8K tokens.",
+                        "length. Linux RTX 4070 Ti SUPER (SM89) benchmarks cover 4K-65K tokens.",
                     },
                 ),
                 "strict": (
@@ -167,19 +185,22 @@ class SolAttentionPatch:
                     "BOOLEAN",
                     {
                         "default": False,
-                        "tooltip": "Quantize q/k to int8 for the exact attention "
-                        "path. On SM120 the inline-Q pointer path is faster from "
-                        "8K upward and reduces peak memory (189 MiB at 32K), at "
-                        "~1% extra numerical error.",
+                        "tooltip": "Quantize q/k for Sol's selected exact-attention blocks. "
+                        "On Linux RTX 4070 Ti SUPER (SM89), measured 1.77-1.96x "
+                        "SageAttention throughput at 4K-65K tokens (tau=1, no sinks). "
+                        "About 0.008 additional relative L2 error versus sparse Sol BF16; "
+                        "this excludes sparsification error versus dense attention.",
                     },
                 ),
                 "int8_pv": (
                     "BOOLEAN",
                     {
                         "default": False,
-                        "tooltip": "Also quantize the P*V dot to int8 (per-token P, "
-                        "per-channel V). Speed is within noise of int8_qk alone; "
-                        "accuracy drops to 0.014 rel L2. Requires int8_qk. Opt-in.",
+                        "tooltip": "Also quantize the P*V dot to int8. Requires int8_qk. "
+                        "On Linux RTX 4070 Ti SUPER (SM89), measured 1.87-2.26x "
+                        "SageAttention throughput at 4K-65K tokens (tau=1, no sinks). "
+                        "About 0.014 additional relative L2 error versus sparse Sol BF16. "
+                        "Opt-in; full-generation speed and visual quality are unmeasured.",
                     },
                 ),
             }
@@ -190,9 +211,12 @@ class SolAttentionPatch:
     CATEGORY = "model_patches/attention"
 
     DESCRIPTION = (
-        "Route this model's self-attention through Sol-Attn (sparse, "
-        "training-free). Only affects the model you wire it to. Falls back to "
-        "your normal backend for any shape it can't handle."
+        "Triton sparse attention for supported NVIDIA GPUs, locally validated on "
+        "Linux with an RTX 4070 Ti SUPER (Ada Lovelace, SM89). Only affects the "
+        "connected model. Requires BF16 self-attention with 128-wide heads; "
+        "masked, precision-opt-out and unsupported calls use your existing backend. "
+        "Sparse attention changes outputs; measured attention speedups do not "
+        "represent full-generation speedups."
     )
 
     def patch(self, model, enabled, tau, min_tokens=8192, strict=False, thresh_type="diag", int8_qk=False, int8_pv=False):

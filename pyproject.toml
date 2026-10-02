@@ -1,0 +1,41 @@
+# ComfyUI custom-node metadata. The original integration was created by
+# Saganaki22 (drbaph); r-vage maintains this continuation after its removal.
+[project]
+name = "comfyui-sol-attn"
+version = "0.6.6"
+description = "Triton sparse attention and MiniMax H3 memory optimizations for ComfyUI. Continued by r-vage from Saganaki22's original integration; validated on Linux with RTX 4070 Ti SUPER (Ada Lovelace, SM89)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+    { name = "r-vage" },
+    { name = "Saganaki22 (drbaph, original author)" },
+]
+maintainers = [{ name = "r-vage" }]
+# ComfyUI supplies its CUDA-enabled torch installation. Keep the Triton backend
+# optional so the feed-forward node can also be used without sparse attention.
+dependencies = ["torch"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
+
+[project.optional-dependencies]
+# The continuation is tested with Triton 3.6.0 on Linux. Windows users retain
+# their existing compatible Triton runtime; do not install the Linux wheel there.
+attention = ["triton>=3.6; sys_platform == 'linux'"]
+preview = ["matplotlib"]
+
+[project.urls]
+Repository = "https://github.com/r-vage/ComfyUI-sol-attn"
+Documentation = "https://github.com/r-vage/ComfyUI-sol-attn#readme"
+"Bug Tracker" = "https://github.com/r-vage/ComfyUI-sol-attn/issues"
+"Original Repository (unavailable)" = "https://github.com/Saganaki22/ComfyUI-sol-attn"
+"Sol-Attn Upstream" = "https://github.com/NVlabs/Sana/tree/sol-engine"
+
+[tool.comfy]
+PublisherId = "rvage"
+DisplayName = "ComfyUI Sol-Attn (continued by r-vage)"
+requires-comfyui = ">=0.30.1"

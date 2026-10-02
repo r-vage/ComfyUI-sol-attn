@@ -3,23 +3,27 @@
 from __future__ import annotations
 
 import importlib
+import inspect
+import os
 import sys
 import unittest
 from pathlib import Path
 
 import torch
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
-COMFY_ROOT = REPO_ROOT.parents[1]
+COMFY_ROOT = Path(os.environ.get("COMFYUI_ROOT", REPO_ROOT.parents[1]))
 CUSTOM_NODES = REPO_ROOT.parent
 for path in (str(COMFY_ROOT), str(CUSTOM_NODES), str(REPO_ROOT)):
     if path not in sys.path:
         sys.path.insert(0, path)
 
 
-fwd = importlib.import_module("sol_kernel.fwd")
-GPU_SUPPORTED = torch.cuda.is_available() and torch.cuda.get_device_capability() in {
+try:
+    fwd = importlib.import_module("sol_kernel.fwd")
+except ImportError:
+    fwd = None
+GPU_SUPPORTED = fwd is not None and torch.cuda.is_available() and torch.cuda.get_device_capability() in {
     (8, 6),
     (8, 9),
     (9, 0),
@@ -29,6 +33,7 @@ GPU_SUPPORTED = torch.cuda.is_available() and torch.cuda.get_device_capability()
 }
 
 
+@unittest.skipIf(fwd is None, "Sol backend dependencies unavailable")
 class ArchitectureDispatchTests(unittest.TestCase):
     def test_pointer_architectures_are_explicit(self):
         self.assertTrue(fwd._use_pointer_arch((8, 6)))
@@ -110,6 +115,7 @@ class InlineQTests(unittest.TestCase):
 class H3FusionTests(unittest.TestCase):
     def test_fused_ops_match_real_comfy_dit_block(self):
         from comfy.ldm.minimax.model import DiTBlock
+
         from sol_kernel.h3_fusion import (
             fused_gate_add_,
             fused_modulate_,
@@ -169,6 +175,58 @@ class H3FusionTests(unittest.TestCase):
         self.assertEqual(calls, 2)
         self.assertTrue(torch.equal(expected, actual))
 
+        if "attention" in inspect.signature(fallback).parameters:
+            def callback(value, **kwargs):
+                return original_attention(value, **kwargs) * 0.5
+
+            with torch.inference_mode():
+                expected = fallback(x.clone(), t_emb, segments, None, attention=callback)
+                actual = fused(x.clone(), t_emb, segments, None, attention=callback)
+            self.assertTrue(torch.equal(expected, actual))
+
+        # Newer ComfyUI supports one modulation row per token. These must take
+        # the real eager implementation, including a supplied callback.
+        from comfy.ldm.minimax import model as comfy_h3
+        if hasattr(comfy_h3, "_mod_row"):
+            rows = torch.arange(tokens, device="cuda") % 9
+            tensor_segments = [(0, tokens, rows)]
+            tensor_log = minimax._FusionLog()
+            tensor_fused = minimax._make_fused_h3_block_forward(
+                block, fallback, minimax._SegmentIndexCache(make_segment_index),
+                tensor_log, fused_modulate_, fused_gate_add_,
+            )
+            with torch.inference_mode():
+                expected = fallback(x.clone(), t_emb, tensor_segments, None)
+                actual = tensor_fused(x.clone(), t_emb, tensor_segments, None)
+            self.assertFalse(tensor_log.active)
+            self.assertTrue(torch.equal(expected, actual))
+
+
+@unittest.skipUnless(GPU_SUPPORTED, "requires a supported CUDA GPU")
+class ConditioningSinkTests(unittest.TestCase):
+    def test_real_attention_conditioning_rows_match_dense(self):
+        from comfy.ldm.minimax.model import Attention, PackedLayout
+
+        minimax = importlib.import_module(f"{REPO_ROOT.name}.minimax")
+        torch.manual_seed(104)
+        layout = PackedLayout(65, 4, 16, 16, 2)
+        attention = Attention(256, 2, 128, 1e-5, dtype=torch.bfloat16,
+                              device="cuda", operations=torch.nn).eval()
+        x = torch.randn(layout.seq_len, 256, device="cuda", dtype=torch.bfloat16)
+        dispatch = minimax._SolLog()
+        run = minimax._make_sol_attention_forward(
+            attention, attention.forward, 4.0, 1, True, dispatch,
+            sink_conditioning="exact_kv_and_rows",
+        )
+        with torch.inference_mode():
+            expected = attention(x.clone())
+            actual = run(x.clone(), transformer_options={"minimax_h3_layout": layout})
+        self.assertTrue(dispatch.active)
+        video_start = next(a for a, b, kind in layout.segments if kind == "video")
+        # Triton and SDPA have different reduction orders, so compare within
+        # BF16 precision rather than requiring bit equality across backends.
+        torch.testing.assert_close(actual[:video_start], expected[:video_start], atol=0.004, rtol=0.02)
+
 
 class H3AttentionHandoffTests(unittest.TestCase):
     def test_dense_fallback_preserves_kjnodes_handoff(self):
@@ -220,7 +278,7 @@ class H3AttentionHandoffTests(unittest.TestCase):
         try:
             minimax.sol_attn = lambda q, k, v, **kwargs: v
             wrapped = minimax._make_sol_attention_forward(
-                Attention(), fallback, 1.3, 1, True, minimax._SolLog()
+                Attention(), fallback, 1.3, 1, True, minimax._SolLog(), sink_conditioning="off"
             )
             actual = wrapped(handoff)
         finally:

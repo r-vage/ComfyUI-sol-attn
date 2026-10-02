@@ -1,8 +1,62 @@
 # Benchmarks
 
+## RTX 4070 Ti SUPER: local run (2026-10-02)
+
+**Hardware/software:** RTX 4070 Ti SUPER, SM89, 16 GB VRAM; Linux x86_64; NVIDIA driver 595.91.07; Python 3.12.10; PyTorch 2.10.0+cu130; CUDA 13.0; Triton 3.6.0; SageAttention 2.2.0. This repository already runs its attention kernels through Triton. The installed Sage dispatcher selects its SM89 CUDA INT8-QK/FP8-PV implementation; SDPA uses PyTorch's default backend selection.
+
+**Scope:** attention kernels only, using the same random BF16 fused-QKV strided views for every method, `B=1, H=56, D=128`, seed 104, `tau=1.0`, `thresh_type=diag`, no mask, no conditioning sinks. The node default is `tau=1.3` with conditioning protection for H3, so this is the historical benchmark configuration, not a default-workflow measurement. Projection, RoPE, block fusion, feed-forward, model loading, sampling, and video generation are excluded. Other Sol repositories were not rerun on this GPU.
+
+**Timing:** three warmups per method after compilation/autotuning, then the median of 20 individually synchronized CUDA-event samples in the second full process run. Method order is seeded and shuffled. No CUDA graphs or explicit cache flushing. The first process also collected three rounds of 20 samples per method; the largest first/second-process median difference across the table was 5.9%. The normal desktop was running; clocks and power were not locked. All measured outputs were finite. Raw samples, timing percentiles, per-round medians, GPU status, and kernel hashes are retained in [the measured run](tests/benchmarks/rtx4070ti-super-2026-10-02.json) and [the first pass](tests/benchmarks/rtx4070ti-super-2026-10-02-first-pass.json).
+
+### Latency (ms per attention call; lower is better)
+
+| Tokens | PyTorch SDPA | SageAttention | Sol BF16 | Sol INT8 QK | Sol INT8 QK+PV |
+|---:|---:|---:|---:|---:|---:|
+| 4,096 | 6.30 | 2.96 | 2.01 | 1.68 | 1.58 |
+| 8,192 | 23.59 | 10.03 | 6.45 | 5.30 | 4.96 |
+| 16,384 | 94.43 | 36.22 | 23.26 | 18.93 | 17.00 |
+| 32,768 | 378.09 | 138.44 | 88.86 | 70.74 | 62.48 |
+| 65,536 | 1,520.34 | 542.52 | 347.42 | 277.65 | 240.13 |
+
+Throughput relative to SageAttention over 4K–65K: Sol BF16: **1.48–1.56×**, Sol INT8 QK: **1.77–1.96×**, Sol INT8 QK+PV: **1.87–2.26×**. These are attention-call ratios, not full-generation speedups.
+
+### Peak working allocation (MiB)
+
+| Tokens | PyTorch SDPA | SageAttention | Sol BF16 | Sol INT8 QK | Sol INT8 QK+PV |
+|---:|---:|---:|---:|---:|---:|
+| 4,096 | 56.9 | 196.3 | 57.8 | 91.9 | 114.7 |
+| 8,192 | 113.8 | 392.6 | 115.6 | 183.8 | 229.4 |
+| 16,384 | 227.5 | 785.2 | 231.1 | 367.5 | 458.6 |
+| 32,768 | 455.0 | 1,570.3 | 462.2 | 735.0 | 917.1 |
+| 65,536 | 910.0 | 3,140.4 | 924.3 | 1,494.6 | 1,834.1 |
+
+Resident fused QKV is excluded; the output and temporary workspaces are included. These are PyTorch allocated-memory peaks, not total VRAM usage or allocator reservations. The 65K input buffer itself occupies 2,688 MiB.
+
+### Numerical differences at 8K
+
+Relative L2 error; lower is closer to the named reference:
+
+| Method | vs dense SDPA | vs sparse Sol BF16 (`tau=1`) |
+|---|---:|---:|
+| SageAttention | 0.038681 | 0.936144 |
+| Sol BF16 | 0.750393 | 0.000000 |
+| Sol INT8 QK | 0.750432 | 0.008050 |
+| Sol INT8 QK+PV | 0.750501 | 0.014016 |
+
+Forcing Sol fully exact with `tau=-100` gives **0.003064** relative L2 versus SDPA. Sparse Sol BF16's much larger difference versus SDPA comes from the approximation, not merely INT8 quantization. The ~0.008/~0.014 INT8 numbers measure additional error relative to already-sparse Sol BF16 and must not be presented as total error versus dense attention. Random-input tensor errors do not establish visual quality; checkpoint generation and full-workflow timing remain unmeasured in this run.
+
+### Reproduce with the existing CUDA environment
+
+```bash
+python tests/benchmark_attention.py --output /tmp/sol-first-pass.json
+python tests/benchmark_attention.py --rounds 1 --output /tmp/sol-measured.json
+```
+
+The script does not install dependencies or fetch repositories. An optional `--tau` and `--sink-tokens` allow explicitly labeled alternate settings. Do not compare those runs to this table without noting the different routing/protection settings.
+
 **v0.6.0 release matrix:** 2026-08-09 · **Historical cross-repo date:** 2026-08-07 · **Machine:** RTX 5090 (SM120) · torch 2.10.0+cu130 · Triton 3.6.0 · Python 3.12.10 · Windows 11
 
-## Method
+## Method (historical RTX 5090 results)
 
 The v0.6.0 release matrix gives every method the **same inputs**: MiniMax H3-shaped strided NHD views into a fused qkv projection buffer (`B=1, H=56, D=128`, bf16, random Gaussian tensors), `tau=1.0`, median of 20 timed iterations after 3 warmup iterations. The table reports the second full process run, after Triton autotune results were cached. SageAttention and PyTorch SDPA are the installed dense baselines. Resident q/k/v storage is excluded from peak working-allocation measurements.
 
@@ -10,7 +64,7 @@ The historical cross-repo section used the same shape, inputs, iteration count, 
 
 > Fidelity warning: these methods are not interchangeable. KingGore's fork uses a **hard block mask** (unselected KV blocks are dropped, ~8–11% density by its own README) while the Sol-Attn implementations keep an approximate correction for unselected blocks (~16% exact at `tau=1.0`). Faster-by-sparser is not the same thing as faster-by-engineering — A/B the visual quality before adopting any of them.
 
-## Current local optimization audit (2026-08-09)
+## RTX 5090 optimization audit (2026-08-09)
 
 These paired tests cover the non-cache optimizations added after v0.5.9. H3 attention shape is `B=1, T=8192, H=56, D=128`, `tau=1.3`, median after warmup. Pointer and TMA outputs were compared with `torch.equal`.
 
@@ -153,7 +207,7 @@ Our residual int8 design (`int8_qk`) is ~3.6× closer to the exact bf16 Sol path
 
 ## The repos compared
 
-- **[Saganaki22/ComfyUI-sol-attn](https://github.com/Saganaki22/ComfyUI-sol-attn)** (this repo) — NVIDIA's Sol-Attn Triton reference, vendored and extended. Feeds the kernel H3's fused qkv views with zero copies (pointer on SM86/SM89/SM120; TMA on SM90/100/121). The `int8_qk` path quantizes only the per-block-mean *residual* of K and adds the mean back from exact bf16 routing scores; SM86/SM89/SM120 derive Q quantization inline. Also ships scheduled tau, conditioning sinks, exact H3 modulation fusion, FFN chunking, and SM121 support.
+- **[Saganaki22/ComfyUI-sol-attn](https://github.com/Saganaki22/ComfyUI-sol-attn)** (original integration; unavailable upstream, continued here by r-vage) — NVIDIA's Sol-Attn Triton reference, vendored and extended. Feeds the kernel H3's fused qkv views with zero copies (pointer on SM86/SM89/SM120; TMA on SM90/100/121). The `int8_qk` path quantizes only the per-block-mean *residual* of K and adds the mean back from exact bf16 routing scores; SM86/SM89/SM120 derive Q quantization inline. Also ships scheduled tau, conditioning sinks, exact H3 modulation fusion, FFN chunking, and SM121 support.
 - **[kijai/ComfyUI-SolAttn_triton](https://github.com/kijai/ComfyUI-SolAttn_triton)** — independent Triton implementation of the same kernel. Clean design: SM89 pointer kernels, fused preprocess, conditioning sinks, Morton token reordering, sigma gating. Its int8 uses global-mean K smoothing over full-magnitude keys. Fastest int8 at 16K–65K on this run; ours leads at 8K.
 - **[KingGore/ComfyUI_sol-attn_Blackwell](https://github.com/KingGore/ComfyUI_sol-attn_Blackwell)** — routes in pure torch and executes the selected blocks with compiled PyTorch `flex_attention`. Legitimately fast (beats SageAttention past 8K), but it is a **different sparsity method**: hard block mask, no approximate correction, much lower density. Compare its quality, not just its speed. SM120 only.
 - **[SageAttention](https://github.com/thu-ml/SageAttention)** (thu-ml) — the dense int8 attention baseline everything here is measured against. Still the right choice below ~4K tokens, which is why our nodes gate on `min_tokens`.

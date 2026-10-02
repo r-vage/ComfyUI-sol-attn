@@ -1,23 +1,33 @@
 """MiniMax H3 memory patches."""
 
+import inspect
 import logging
 import math
+import operator
 import re
 
 import torch
 
 log = logging.getLogger(__name__)
 
+LAYOUT_IMPORT_ERROR = None
+BACKEND_IMPORT_ERROR = None
+COMFY_OPS_IMPORT_ERROR = None
+try:
+    from comfy.ldm.minimax.model import PackedLayout
+except Exception as exc:  # noqa: BLE001 - optional runtime may fail during initialization
+    PackedLayout = None
+    LAYOUT_IMPORT_ERROR = exc
+try:
+    from .sol_kernel import sol_attn
+except Exception as exc:  # noqa: BLE001 - keep FFN usable without the backend
+    sol_attn = None
+    BACKEND_IMPORT_ERROR = exc
 try:
     import comfy.model_management
     import comfy.quant_ops
-
-    from comfy.ldm.minimax.model import PackedLayout
-
-    from .sol_kernel import sol_attn
-except Exception:  # Triton or ComfyUI kitchen ops unavailable; FFN node still loads
-    sol_attn = None
-    PackedLayout = None
+except Exception as exc:  # noqa: BLE001 - independent optional rotary backend
+    COMFY_OPS_IMPORT_ERROR = exc
 
 SOL_ARCHES = {(8, 6), (8, 9), (9, 0), (10, 0), (12, 0), (12, 1)}
 
@@ -85,7 +95,8 @@ class MiniMaxH3ChunkFeedForward:
     CATEGORY = "model_patches/memory"
     DESCRIPTION = (
         "Chunk MiniMax H3's token-local feed-forward activations to reduce peak "
-        "VRAM. More chunks may reduce throughput or produce small numerical differences."
+        "VRAM. Independent of the attention backend and usable without Triton. "
+        "More chunks may reduce throughput or produce small numerical differences."
     )
 
     def patch(self, model, enabled, chunks, min_tokens):
@@ -156,6 +167,8 @@ class _SegmentIndexCache:
         self.value = None
 
     def get(self, tokens, segments, device, table_rows):
+        if any(torch.is_tensor(row) for _, _, row in segments):
+            raise _FusionUnsupported("per-token modulation rows require eager execution")
         normalized = tuple((int(a), int(b), int(row)) for a, b, row in segments)
         if not normalized or max(row for _, _, row in normalized) >= int(table_rows):
             raise ValueError("modulation segment references a missing AdaLN row")
@@ -181,8 +194,20 @@ def _make_fused_h3_block_forward(
     node continue to compose regardless of node order.
     """
 
-    def forward(x, t_emb, mod_segments, rope_freqs, transformer_options={}):
+    def forward(x, t_emb, mod_segments, rope_freqs, transformer_options=None, attention=None):
+        if transformer_options is None:
+            transformer_options = {}
+        def fallback():
+            kwargs = {"transformer_options": transformer_options}
+            # Legacy blocks lack this keyword. An explicit override must never
+            # disappear: unsupported legacy callbacks raise their normal error.
+            if attention is not None:
+                kwargs["attention"] = attention
+            return fallback_forward(x, t_emb, mod_segments, rope_freqs, **kwargs)
+
         try:
+            if any(torch.is_tensor(row) for _, _, row in mod_segments):
+                raise _FusionUnsupported("per-token modulation rows require eager execution")
             if (
                 x.ndim != 2
                 or x.dtype != torch.bfloat16
@@ -203,35 +228,24 @@ def _make_fused_h3_block_forward(
             h = fused_modulate(block.norm1(x), shift_msa, scale_msa, row_index)
         except _FusionUnsupported as exc:
             fusion_log.miss(str(exc))
-            return fallback_forward(
-                x,
-                t_emb,
-                mod_segments,
-                rope_freqs,
-                transformer_options=transformer_options,
-            )
-        except Exception as exc:
+            return fallback()
+        except Exception as exc:  # noqa: BLE001 - safe fallback before residual mutation
             # x is still pristine, so a backend/compiler incompatibility can
             # safely fall back. After the first gate below, exceptions must
             # propagate because eager retry would consume a modified residual.
             fusion_log.miss(f"{type(exc).__name__}: {exc}")
-            return fallback_forward(
-                x,
-                t_emb,
-                mod_segments,
-                rope_freqs,
-                transformer_options=transformer_options,
-            )
+            return fallback()
 
         # Attention is intentionally outside the fallback catch: strict errors
         # from a Sol/Sage patch must propagate, and should never be converted
         # into an eager full-block retry by this unrelated fusion.
-        attention = block.attn(
+        attention_fn = block.attn if attention is None else attention
+        attended = attention_fn(
             h,
             rope_freqs=rope_freqs,
             transformer_options=transformer_options,
         )
-        x = fused_gate_add(x, gate_msa, attention, row_index)
+        x = fused_gate_add(x, gate_msa, attended, row_index)
         h = fused_modulate(block.norm2(x), shift_mlp, scale_mlp, row_index)
         x = fused_gate_add(x, gate_mlp, block.mlp(h), row_index)
         fusion_log.hit(x.shape[0], len(mod_segments))
@@ -257,7 +271,9 @@ class MiniMaxH3FusedModulation:
     DESCRIPTION = (
         "Fuse MiniMax H3's segmented AdaLN scale/shift and gated residual "
         "updates while reproducing the eager BF16 rounding exactly. Independent "
-        "of the selected attention backend."
+        "of the selected attention backend. Validated on Linux / RTX 4070 Ti SUPER "
+        "(Ada Lovelace, SM89). Per-token modulation uses the original eager block; "
+        "attention callbacks are preserved."
     )
 
     def patch(self, model, enabled):
@@ -295,7 +311,7 @@ class MiniMaxH3FusedModulation:
                     i,
                 )
                 continue
-            fallback_forward = prior if prior is not None else block.forward
+            fallback_forward = patched.get_model_object(path)
             if hasattr(fallback_forward, "_minimax_h3_fusion_fallback"):
                 fallback_forward = fallback_forward._minimax_h3_fusion_fallback
             patched.add_object_patch(
@@ -349,7 +365,9 @@ def _make_sol_attention_forward(attn, fallback_forward, tau, min_tokens, strict,
     heads, head_dim = attn.heads, attn.head_dim
     inner = heads * head_dim
 
-    def forward(x, rope_freqs=None, transformer_options={}):
+    def forward(x, rope_freqs=None, transformer_options=None):
+        if transformer_options is None:
+            transformer_options = {}
         # KJNodes' MiniMax H3 Low VRAM Attention block transfers ownership of
         # its normed activation in a single-item list.  Peek while deciding
         # whether Sol can take the call: an ineligible call must leave the list
@@ -358,6 +376,10 @@ def _make_sol_attention_forward(attn, fallback_forward, tau, min_tokens, strict,
         tensor = x[0] if handoff else x
         handoff_released = False
         try:
+            if sol_attn is None:
+                raise _Unsupported(f"Sol backend unavailable: {BACKEND_IMPORT_ERROR}")
+            if (transformer_options or {}).get("low_precision_attention", True) is False:
+                raise _Unsupported("low_precision_attention=False")
             if not torch.is_tensor(tensor):
                 raise _Unsupported("attention input is not a tensor")
             s = tensor.shape[0]
@@ -379,13 +401,12 @@ def _make_sol_attention_forward(attn, fallback_forward, tau, min_tokens, strict,
             sink_blocks = (0, 0)
             sink_q = (0, 0)
             if sink_conditioning != "off":
-                span = (transformer_options or {}).get("sol_h3_video_span")
-                if span is not None:
-                    video_start, video_stop = span
-                    if 0 < video_start and s >= video_stop:
-                        sink_blocks = (0, (video_start + 63) // 64)
-                        if sink_conditioning == "exact_kv_and_rows":
-                            sink_q = sink_blocks
+                video_start, _ = _conditioning_span(transformer_options or {}, s)
+                sink_blocks = (0, (video_start + 63) // 64)
+                if sink_conditioning == "exact_kv_and_rows":
+                    sink_q = sink_blocks
+            if rope_freqs is not None and COMFY_OPS_IMPORT_ERROR is not None:
+                raise _Unsupported(f"ComfyUI rotary ops unavailable: {COMFY_OPS_IMPORT_ERROR}")
 
             # Commit the KJNodes ownership transfer only after every dense
             # fallback gate has passed.  Releasing `tensor` after qkv is the
@@ -477,40 +498,80 @@ class _TauSchedule:
         return self.tau_end + (self.tau_start - self.tau_end) * self.weight(1.0 - self.progress(sigma))
 
 
-def _make_span_injector(original_forward):
-    """Publish H3's video segment span into transformer_options for the sink gate.
-
-    Mirrors MiniMaxH3Model._forward's layout handling: reuse the payload's
-    prebuilt layout when its signature matches, rebuild it the same way
-    otherwise. Adds one small layout construction per model call at most.
-    """
-
-    def forward(x, timestep, context, transformer_options={}, minimax_payload=None, **kwargs):
-        if isinstance(transformer_options, dict) and PackedLayout is not None:
-            payload = minimax_payload or {}
-            video_x, audio_x = x[0], x[1]
-            signature = (
-                context.shape[1],
-                video_x.shape[2],
-                -(-video_x.shape[3] // 2) * 2,
-                -(-video_x.shape[4] // 2) * 2,
-                audio_x.shape[-1],
-            )
-            layout = payload.get("layout")
-            try:
+def _conditioning_span(options, tokens):
+    """Prefer the layout published inside this call; adapt legacy calls lazily."""
+    try:
+        layout = options.get("minimax_h3_layout")
+        state = options.get("sol_h3_layout_state")
+        if layout is None:
+            if state is None:
+                raise ValueError("no current-call layout or legacy layout context")
+            if state.get("error"):
+                raise ValueError(state["error"])
+            layout = state.get("layout")
+            if layout is None:
+                signature, payload = state["signature"], state["payload"]
+                layout = payload.get("layout")
                 if layout is None or layout.signature != signature:
-                    layout = PackedLayout(
-                        *signature,
-                        keyframes=payload.get("keyframes"),
-                        refs=payload.get("refs"),
-                        frame_count=payload.get("frame_count"),
-                    )
-                span = next(((a, b) for a, b, kind in layout.segments if kind == "video"), None)
-            except Exception:
-                span = None
-            if span is not None:
-                transformer_options["sol_h3_video_span"] = span
-        return original_forward(x, timestep, context, transformer_options, minimax_payload=minimax_payload, **kwargs)
+                    if PackedLayout is None:
+                        raise ValueError(f"ComfyUI PackedLayout unavailable: {LAYOUT_IMPORT_ERROR}")
+                    parameters = inspect.signature(PackedLayout).parameters
+                    supported = {name: payload.get(name) for name in
+                                 ("keyframes", "refs", "frame_count") if name in parameters}
+                    layout = PackedLayout(*signature, **supported)
+                state["layout"] = layout
+        if state is not None and layout.signature != state["signature"]:
+            raise ValueError("layout signature does not match the current model input")
+        if layout.seq_len != tokens:
+            raise ValueError(f"layout length {layout.seq_len} != packed sequence {tokens}")
+        cursor = 0
+        spans = []
+        for start, stop, kind in layout.segments:
+            start, stop = operator.index(start), operator.index(stop)
+            if start != cursor or not start <= stop <= tokens:
+                raise ValueError("layout segments are not contiguous and in range")
+            cursor = stop
+            if kind == "video":
+                spans.append((start, stop))
+        if cursor != tokens or len(spans) != 1:
+            raise ValueError("layout must cover the sequence with one video segment")
+        start, stop = spans[0]
+        if not 0 <= start < stop == tokens:
+            raise ValueError("video span must be nonempty and end at the packed sequence boundary")
+        return start, stop
+    except Exception as exc:
+        reason = f"conditioning protection unavailable: {type(exc).__name__}: {exc}"
+        # Avoid repeatedly constructing a broken legacy layout in each block.
+        if options.get("sol_h3_layout_state") is not None:
+            options["sol_h3_layout_state"].setdefault("error", str(exc))
+        raise _Unsupported(reason) from exc
+
+
+def _make_span_injector(original_forward):
+    """Reset per-call state before Comfy publishes its authoritative layout.
+
+    The legacy adapter is lazy so modern calls never build a second layout.
+    No layout constructor or Triton dependency is needed at model entry.
+    """
+    def forward(x, timestep, context, transformer_options=None, minimax_payload=None, **kwargs):
+        if transformer_options is None:
+            transformer_options = {}
+        for key in ("sol_h3_video_span", "sol_h3_layout_state", "minimax_h3_layout"):
+            transformer_options.pop(key, None)
+        state = {}
+        transformer_options["sol_h3_layout_state"] = state
+        try:
+            video_x, audio_x = x[0], x[1]
+            state["signature"] = (
+                context.shape[1], video_x.shape[2],
+                -(-video_x.shape[3] // 2) * 2,
+                -(-video_x.shape[4] // 2) * 2, audio_x.shape[-1],
+            )
+            state["payload"] = minimax_payload or {}
+        except Exception as exc:  # noqa: BLE001 - dense attention reports malformed layout context
+            state["error"] = f"cannot establish input layout: {type(exc).__name__}: {exc}"
+        return original_forward(x, timestep, context, transformer_options,
+                                minimax_payload=minimax_payload, **kwargs)
 
     forward._minimax_h3_span_fallback = original_forward
     return forward
@@ -521,6 +582,28 @@ def _install_span_injector(patched):
     if hasattr(model_forward, "_minimax_h3_span_fallback"):
         model_forward = model_forward._minimax_h3_span_fallback
     patched.add_object_patch("diffusion_model._forward", _make_span_injector(model_forward))
+
+
+def _install_sol_patches(patched, count, dense_blocks, tau, min_tokens, strict, **kwargs):
+    _install_span_injector(patched)
+    sol_log = _SolLog()
+    dense = _parse_dense_blocks(dense_blocks, count)
+    for i in range(count):
+        path = f"diffusion_model.blocks.{i}.attn.forward"
+        # get_model_object also resolves backups when the shared model is loaded.
+        current = patched.get_model_object(path)
+        fallback = current
+        while hasattr(fallback, "_minimax_h3_sol_fallback"):
+            fallback = fallback._minimax_h3_sol_fallback
+        if i in dense:
+            if fallback is not current:
+                patched.add_object_patch(path, fallback)
+            continue
+        attn = patched.get_model_object(f"diffusion_model.blocks.{i}.attn")
+        patched.add_object_patch(path, _make_sol_attention_forward(
+            attn, fallback, tau, int(min_tokens), bool(strict), sol_log, **kwargs,
+        ))
+    return dense
 
 
 def _parse_dense_blocks(spec, count):
@@ -655,19 +738,22 @@ class MiniMaxH3ScheduledSolAttentionPatch:
                     "BOOLEAN",
                     {
                         "default": False,
-                        "tooltip": "Quantize q/k to int8 for the exact attention "
-                        "path. On SM120 the inline-Q pointer path is faster from "
-                        "8K upward and reduces peak memory (189 MiB at 32K), at "
-                        "~1% extra numerical error.",
+                        "tooltip": "Quantize q/k for Sol's selected exact-attention blocks. "
+                        "On Linux RTX 4070 Ti SUPER (SM89), measured 1.77-1.96x "
+                        "SageAttention throughput at 4K-65K tokens (tau=1, no sinks). "
+                        "About 0.008 additional relative L2 error versus sparse Sol BF16; "
+                        "this excludes sparsification error versus dense attention.",
                     },
                 ),
                 "int8_pv": (
                     "BOOLEAN",
                     {
                         "default": False,
-                        "tooltip": "Also quantize the P*V dot to int8 (per-token P, "
-                        "per-channel V). Speed is within noise of int8_qk alone; "
-                        "accuracy drops to 0.014 rel L2. Requires int8_qk. Opt-in.",
+                        "tooltip": "Also quantize the P*V dot to int8. Requires int8_qk. "
+                        "On Linux RTX 4070 Ti SUPER (SM89), measured 1.87-2.26x "
+                        "SageAttention throughput at 4K-65K tokens (tau=1, no sinks). "
+                        "About 0.014 additional relative L2 error versus sparse Sol BF16. "
+                        "Opt-in; full-generation speed and visual quality are unmeasured.",
                     },
                 ),
                 "sink_conditioning": (
@@ -675,9 +761,9 @@ class MiniMaxH3ScheduledSolAttentionPatch:
                     {
                         "default": "exact_kv",
                         "tooltip": "Keep H3's packed text/conditioning/reference/audio "
-                        "KV blocks exact (~3% cost, protects prompt adherence and "
-                        "audio sync). exact_kv_and_rows also runs those query rows "
-                        "dense (~20% cost). off disables the sink.",
+                        "KV blocks exact. exact_kv_and_rows also runs those query rows "
+                        "dense. Missing or invalid layouts use the captured dense fallback. "
+                        "off disables protection. Cost depends on layout and GPU.",
                     },
                 ),
                 "dense_blocks": (
@@ -700,7 +786,10 @@ class MiniMaxH3ScheduledSolAttentionPatch:
     DESCRIPTION = (
         "MiniMax H3 memory-efficient Sol attention with tau ramped across "
         "sampling: sparse on early high-noise steps, denser on late detail "
-        "steps. tau_graph previews the schedule; wire it to a Preview Image node."
+        "steps. Uses Triton, validated on Linux / RTX 4070 Ti SUPER (Ada Lovelace, "
+        "SM89). Conditioning protection uses the current packed layout and falls "
+        "back to dense attention if it cannot be established. tau_graph previews "
+        "the schedule; wire it to a Preview Image node."
     )
 
     def patch(self, model, enabled, tau_start, tau_end, curve, min_tokens, strict, dense_percent, thresh_type, int8_qk, int8_pv, sink_conditioning, dense_blocks):
@@ -710,7 +799,7 @@ class MiniMaxH3ScheduledSolAttentionPatch:
         if sol_attn is None:
             raise RuntimeError(
                 "MiniMax H3 Scheduled Sol Attention Patch requires Triton; "
-                "the Sol Triton backend failed to import."
+                f"the Sol Triton backend failed to import: {BACKEND_IMPORT_ERROR}"
             )
 
         diffusion_model = model.get_model_object("diffusion_model")
@@ -728,28 +817,12 @@ class MiniMaxH3ScheduledSolAttentionPatch:
             float(model_sampling.percent_to_sigma(0.0)),
             float(model_sampling.percent_to_sigma(1.0)),
         )
-        _install_span_injector(patched)
-
-        sol_log = _SolLog()
-        dense = _parse_dense_blocks(dense_blocks, len(blocks))
-        for i in range(len(blocks)):
-            if i in dense:
-                continue
-            attn = patched.get_model_object(f"diffusion_model.blocks.{i}.attn")
-            # adopt an earlier node's attn.forward patch (e.g. a memory-efficient
-            # sage patch) as the fallback for gated/ineligible calls
-            prior = getattr(patched, "object_patches", {}).get(f"diffusion_model.blocks.{i}.attn.forward")
-            fallback_forward = prior if prior is not None else attn.forward
-            if hasattr(fallback_forward, "_minimax_h3_sol_fallback"):
-                fallback_forward = fallback_forward._minimax_h3_sol_fallback
-            patched.add_object_patch(
-                f"diffusion_model.blocks.{i}.attn.forward",
-                _make_sol_attention_forward(
-                    attn, fallback_forward, schedule.tau, int(min_tokens), bool(strict), sol_log,
-                    thresh_type, float(dense_percent), schedule.progress, bool(int8_qk),
-                    bool(int8_pv), sink_conditioning,
-                ),
-            )
+        dense = _install_sol_patches(
+            patched, len(blocks), dense_blocks, schedule.tau, min_tokens, strict,
+            thresh_type=thresh_type, dense_percent=float(dense_percent),
+            progress_fn=schedule.progress, int8_qk=bool(int8_qk),
+            int8_pv=bool(int8_pv), sink_conditioning=sink_conditioning,
+        )
 
         log.info(
             "[MiniMax H3 Sol] scheduled tau %.2f -> %.2f (%s) on %d of %d blocks (min_tokens=%d, strict=%s, dense=%.0f%%, thresh=%s)",
@@ -817,19 +890,22 @@ class MiniMaxH3MemoryEfficientSolAttentionPatch:
                     "BOOLEAN",
                     {
                         "default": False,
-                        "tooltip": "Quantize q/k to int8 for the exact attention "
-                        "path. On SM120 the inline-Q pointer path is faster from "
-                        "8K upward and reduces peak memory (189 MiB at 32K), at "
-                        "~1% extra numerical error.",
+                        "tooltip": "Quantize q/k for Sol's selected exact-attention blocks. "
+                        "On Linux RTX 4070 Ti SUPER (SM89), measured 1.77-1.96x "
+                        "SageAttention throughput at 4K-65K tokens (tau=1, no sinks). "
+                        "About 0.008 additional relative L2 error versus sparse Sol BF16; "
+                        "this excludes sparsification error versus dense attention.",
                     },
                 ),
                 "int8_pv": (
                     "BOOLEAN",
                     {
                         "default": False,
-                        "tooltip": "Also quantize the P*V dot to int8 (per-token P, "
-                        "per-channel V). Speed is within noise of int8_qk alone; "
-                        "accuracy drops to 0.014 rel L2. Requires int8_qk. Opt-in.",
+                        "tooltip": "Also quantize the P*V dot to int8. Requires int8_qk. "
+                        "On Linux RTX 4070 Ti SUPER (SM89), measured 1.87-2.26x "
+                        "SageAttention throughput at 4K-65K tokens (tau=1, no sinks). "
+                        "About 0.014 additional relative L2 error versus sparse Sol BF16. "
+                        "Opt-in; full-generation speed and visual quality are unmeasured.",
                     },
                 ),
                 "sink_conditioning": (
@@ -837,9 +913,9 @@ class MiniMaxH3MemoryEfficientSolAttentionPatch:
                     {
                         "default": "exact_kv",
                         "tooltip": "Keep H3's packed text/conditioning/reference/audio "
-                        "KV blocks exact (~3% cost, protects prompt adherence and "
-                        "audio sync). exact_kv_and_rows also runs those query rows "
-                        "dense (~20% cost). off disables the sink.",
+                        "KV blocks exact. exact_kv_and_rows also runs those query rows "
+                        "dense. Missing or invalid layouts use the captured dense fallback. "
+                        "off disables protection. Cost depends on layout and GPU.",
                     },
                 ),
                 "dense_blocks": (
@@ -861,8 +937,9 @@ class MiniMaxH3MemoryEfficientSolAttentionPatch:
     DESCRIPTION = (
         "Run MiniMax H3 self-attention through Sol-Attn on strided views of the "
         "fused qkv projection, avoiding the q/k/v copies the generic Sol-Attn "
-        "node makes. Blocks that do not meet the kernel's constraints use the "
-        "stock attention forward."
+        "node makes. Uses Triton, validated on Linux / RTX 4070 Ti SUPER "
+        "(Ada Lovelace, SM89). Unsupported calls, or calls without a valid layout "
+        "for requested conditioning protection, use the captured attention fallback."
     )
 
     def patch(self, model, enabled, tau, min_tokens, strict, thresh_type, int8_qk, int8_pv, sink_conditioning, dense_blocks):
@@ -871,7 +948,7 @@ class MiniMaxH3MemoryEfficientSolAttentionPatch:
         if sol_attn is None:
             raise RuntimeError(
                 "MiniMax H3 Memory Efficient Sol Attention Patch requires Triton; "
-                "the Sol Triton backend failed to import."
+                f"the Sol Triton backend failed to import: {BACKEND_IMPORT_ERROR}"
             )
 
         diffusion_model = model.get_model_object("diffusion_model")
@@ -881,26 +958,11 @@ class MiniMaxH3MemoryEfficientSolAttentionPatch:
             return (model,)
 
         patched = model.clone()
-        _install_span_injector(patched)
-        sol_log = _SolLog()
-        dense = _parse_dense_blocks(dense_blocks, len(blocks))
-        for i in range(len(blocks)):
-            if i in dense:
-                continue
-            attn = patched.get_model_object(f"diffusion_model.blocks.{i}.attn")
-            # adopt an earlier node's attn.forward patch (e.g. a memory-efficient
-            # sage patch) as the fallback for gated/ineligible calls
-            prior = getattr(patched, "object_patches", {}).get(f"diffusion_model.blocks.{i}.attn.forward")
-            fallback_forward = prior if prior is not None else attn.forward
-            if hasattr(fallback_forward, "_minimax_h3_sol_fallback"):
-                fallback_forward = fallback_forward._minimax_h3_sol_fallback
-            patched.add_object_patch(
-                f"diffusion_model.blocks.{i}.attn.forward",
-                _make_sol_attention_forward(
-                    attn, fallback_forward, float(tau), int(min_tokens), bool(strict), sol_log,
-                    thresh_type, int8_qk=bool(int8_qk), int8_pv=bool(int8_pv), sink_conditioning=sink_conditioning,
-                ),
-            )
+        dense = _install_sol_patches(
+            patched, len(blocks), dense_blocks, float(tau), min_tokens, strict,
+            thresh_type=thresh_type, int8_qk=bool(int8_qk), int8_pv=bool(int8_pv),
+            sink_conditioning=sink_conditioning,
+        )
 
         log.info(
             "[MiniMax H3 Sol] patched %d of %d attention blocks (tau=%.2f, min_tokens=%d, strict=%s)",

@@ -1,0 +1,351 @@
+{
+  "SolAttentionPatch": {
+    "inputs": {
+      "required": {
+        "model": [
+          "MODEL"
+        ],
+        "enabled": [
+          "BOOLEAN",
+          {
+            "default": true
+          }
+        ],
+        "tau": [
+          "FLOAT",
+          {
+            "default": 1.3,
+            "min": 0.0,
+            "max": 4.0,
+            "step": 0.05,
+            "tooltip": "Routing threshold. Higher = more blocks take the approximate path = faster, lower fidelity. 1.0 is the Sol-Attn paper default; 1.3 is tuned here."
+          }
+        ],
+        "min_tokens": [
+          "INT",
+          {
+            "default": 4096,
+            "min": 256,
+            "max": 131072,
+            "step": 64,
+            "tooltip": "Use the normal backend below this sequence length. The paper evaluates RTX 5090 kernels from 8K tokens."
+          }
+        ],
+        "strict": [
+          "BOOLEAN",
+          {
+            "default": false,
+            "tooltip": "Raise kernel errors instead of falling back. Enable while validating a new GPU or Triton version."
+          }
+        ],
+        "thresh_type": [
+          [
+            "diag",
+            "exact"
+          ],
+          {
+            "default": "diag",
+            "tooltip": "Routing threshold estimator. diag is the evaluated default; exact uses second-moment statistics for more precise routing at extra precompute cost."
+          }
+        ],
+        "int8_qk": [
+          "BOOLEAN",
+          {
+            "default": false,
+            "tooltip": "Quantize q/k to int8 for the exact attention path. On SM120 the inline-Q pointer path is faster from 8K upward and reduces peak memory (189 MiB at 32K), at ~1% extra numerical error."
+          }
+        ],
+        "int8_pv": [
+          "BOOLEAN",
+          {
+            "default": false,
+            "tooltip": "Also quantize the P*V dot to int8 (per-token P, per-channel V). Speed is within noise of int8_qk alone; accuracy drops to 0.014 rel L2. Requires int8_qk. Opt-in."
+          }
+        ]
+      }
+    },
+    "outputs": [
+      "MODEL"
+    ],
+    "function": "patch",
+    "category": "model_patches/attention",
+    "display_name": "Sol-Attn (sparse attention)"
+  },
+  "MiniMaxH3ChunkFeedForward": {
+    "inputs": {
+      "required": {
+        "model": [
+          "MODEL"
+        ],
+        "enabled": [
+          "BOOLEAN",
+          {
+            "default": true
+          }
+        ],
+        "chunks": [
+          "INT",
+          {
+            "default": 2,
+            "min": 1,
+            "max": 64,
+            "step": 1,
+            "tooltip": "More chunks reduce peak MLP activation memory but add overhead."
+          }
+        ],
+        "min_tokens": [
+          "INT",
+          {
+            "default": 8192,
+            "min": 256,
+            "max": 131072,
+            "step": 256,
+            "tooltip": "Keep the normal full-width MLP below this packed sequence length."
+          }
+        ]
+      }
+    },
+    "outputs": [
+      "MODEL"
+    ],
+    "function": "patch",
+    "category": "model_patches/memory",
+    "display_name": "MiniMax H3 Chunk FeedForward"
+  },
+  "MiniMaxH3FusedModulation": {
+    "inputs": {
+      "required": {
+        "model": [
+          "MODEL"
+        ],
+        "enabled": [
+          "BOOLEAN",
+          {
+            "default": true
+          }
+        ]
+      }
+    },
+    "outputs": [
+      "MODEL"
+    ],
+    "function": "patch",
+    "category": "model_patches/optimization",
+    "display_name": "MiniMax H3 Fused Modulation"
+  },
+  "MiniMaxH3MemoryEfficientSolAttentionPatch": {
+    "inputs": {
+      "required": {
+        "model": [
+          "MODEL"
+        ],
+        "enabled": [
+          "BOOLEAN",
+          {
+            "default": true
+          }
+        ],
+        "tau": [
+          "FLOAT",
+          {
+            "default": 1.3,
+            "min": 0.0,
+            "max": 4.0,
+            "step": 0.05,
+            "tooltip": "Routing threshold. Higher = more blocks take the approximate path = faster, lower fidelity. 1.0 is the Sol-Attn paper default; 1.3 is tuned here."
+          }
+        ],
+        "min_tokens": [
+          "INT",
+          {
+            "default": 4096,
+            "min": 256,
+            "max": 131072,
+            "step": 256,
+            "tooltip": "Use the stock attention forward below this packed sequence length."
+          }
+        ],
+        "strict": [
+          "BOOLEAN",
+          {
+            "default": false,
+            "tooltip": "Raise kernel errors instead of falling back. Enable while validating a new GPU or Triton version."
+          }
+        ],
+        "thresh_type": [
+          [
+            "diag",
+            "exact"
+          ],
+          {
+            "default": "diag",
+            "tooltip": "Routing threshold estimator. diag is the evaluated default; exact uses second-moment statistics for more precise routing at extra precompute cost."
+          }
+        ],
+        "int8_qk": [
+          "BOOLEAN",
+          {
+            "default": false,
+            "tooltip": "Quantize q/k to int8 for the exact attention path. On SM120 the inline-Q pointer path is faster from 8K upward and reduces peak memory (189 MiB at 32K), at ~1% extra numerical error."
+          }
+        ],
+        "int8_pv": [
+          "BOOLEAN",
+          {
+            "default": false,
+            "tooltip": "Also quantize the P*V dot to int8 (per-token P, per-channel V). Speed is within noise of int8_qk alone; accuracy drops to 0.014 rel L2. Requires int8_qk. Opt-in."
+          }
+        ],
+        "sink_conditioning": [
+          [
+            "exact_kv",
+            "exact_kv_and_rows",
+            "off"
+          ],
+          {
+            "default": "exact_kv",
+            "tooltip": "Keep H3's packed text/conditioning/reference/audio KV blocks exact (~3% cost, protects prompt adherence and audio sync). exact_kv_and_rows also runs those query rows dense (~20% cost). off disables the sink."
+          }
+        ],
+        "dense_blocks": [
+          "STRING",
+          {
+            "default": "",
+            "tooltip": "Transformer blocks to keep dense, e.g. '0-2,-1' for the first three and the last. Negative indices count from the end. First and last blocks are the most approximation-sensitive. Empty sparsifies all."
+          }
+        ]
+      }
+    },
+    "outputs": [
+      "MODEL"
+    ],
+    "function": "patch",
+    "category": "model_patches/attention",
+    "display_name": "MiniMax H3 Memory Efficient Sol Attention Patch"
+  },
+  "MiniMaxH3ScheduledSolAttentionPatch": {
+    "inputs": {
+      "required": {
+        "model": [
+          "MODEL"
+        ],
+        "enabled": [
+          "BOOLEAN",
+          {
+            "default": true
+          }
+        ],
+        "tau_start": [
+          "FLOAT",
+          {
+            "default": 1.3,
+            "min": 0.0,
+            "max": 4.0,
+            "step": 0.05,
+            "tooltip": "tau on the first, highest-noise step. Higher = more blocks take the approximate path = faster, lower fidelity."
+          }
+        ],
+        "tau_end": [
+          "FLOAT",
+          {
+            "default": 0.8,
+            "min": 0.0,
+            "max": 4.0,
+            "step": 0.05,
+            "tooltip": "tau on the final, low-noise steps where detail forms. Lower = denser attention at the end of sampling."
+          }
+        ],
+        "curve": [
+          [
+            "linear",
+            "cosine",
+            "sqrt",
+            "smoothstep",
+            "exponential",
+            "step"
+          ],
+          {
+            "default": "linear",
+            "tooltip": "How tau interpolates between tau_start and tau_end across sampling. step switches at the midpoint."
+          }
+        ],
+        "min_tokens": [
+          "INT",
+          {
+            "default": 4096,
+            "min": 256,
+            "max": 131072,
+            "step": 256,
+            "tooltip": "Use the stock attention forward below this packed sequence length."
+          }
+        ],
+        "strict": [
+          "BOOLEAN",
+          {
+            "default": false,
+            "tooltip": "Raise kernel errors instead of falling back. Enable while validating a new GPU or Triton version."
+          }
+        ],
+        "dense_percent": [
+          "FLOAT",
+          {
+            "default": 0.0,
+            "min": 0.0,
+            "max": 0.9,
+            "step": 0.05,
+            "tooltip": "Keep the stock dense attention for this fraction of early sampling (the Sol-Attn paper's recipe: 0.2). 0 disables the gate."
+          }
+        ],
+        "thresh_type": [
+          [
+            "diag",
+            "exact"
+          ],
+          {
+            "default": "diag",
+            "tooltip": "Routing threshold estimator. diag is the evaluated default; exact uses second-moment statistics for more precise routing at extra precompute cost."
+          }
+        ],
+        "int8_qk": [
+          "BOOLEAN",
+          {
+            "default": false,
+            "tooltip": "Quantize q/k to int8 for the exact attention path. On SM120 the inline-Q pointer path is faster from 8K upward and reduces peak memory (189 MiB at 32K), at ~1% extra numerical error."
+          }
+        ],
+        "int8_pv": [
+          "BOOLEAN",
+          {
+            "default": false,
+            "tooltip": "Also quantize the P*V dot to int8 (per-token P, per-channel V). Speed is within noise of int8_qk alone; accuracy drops to 0.014 rel L2. Requires int8_qk. Opt-in."
+          }
+        ],
+        "sink_conditioning": [
+          [
+            "exact_kv",
+            "exact_kv_and_rows",
+            "off"
+          ],
+          {
+            "default": "exact_kv",
+            "tooltip": "Keep H3's packed text/conditioning/reference/audio KV blocks exact (~3% cost, protects prompt adherence and audio sync). exact_kv_and_rows also runs those query rows dense (~20% cost). off disables the sink."
+          }
+        ],
+        "dense_blocks": [
+          "STRING",
+          {
+            "default": "",
+            "tooltip": "Transformer blocks to keep dense, e.g. '0-2,-1' for the first three and the last. Negative indices count from the end. First and last blocks are the most approximation-sensitive. Empty sparsifies all."
+          }
+        ]
+      }
+    },
+    "outputs": [
+      "MODEL",
+      "IMAGE"
+    ],
+    "function": "patch",
+    "category": "model_patches/attention",
+    "display_name": "MiniMax H3 Scheduled Sol Attention Patch"
+  }
+}
